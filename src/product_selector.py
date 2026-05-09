@@ -134,6 +134,10 @@ def format_product_info(item: dict) -> dict:
     image_urls = item.get("mediumImageUrls", [])
     image_url = image_urls[0] if image_urls else ""
 
+        item_code_full = item.get("itemCode", "")
+    shop_code = item_code_full.split(":")[0] if ":" in item_code_full else ""
+    item_code = item_code_full.split(":")[1] if ":" in item_code_full else item_code_full
+
     return {
         "name": item.get("itemName", ""),
         "price": item.get("itemPrice", 0),
@@ -145,7 +149,11 @@ def format_product_info(item: dict) -> dict:
         "image_url": image_url,
         "item_caption": item.get("itemCaption", ""),
         "genre_id": item.get("genreId", ""),
+        "item_code": item_code,
+        "shop_code": shop_code,
+        "item_code_full": item_code_full,
     }
+
 
 
 if __name__ == "__main__":
