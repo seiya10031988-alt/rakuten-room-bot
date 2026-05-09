@@ -1,41 +1,25 @@
 """
 room_poster.py
 クッキーを使って楽天Roomに自動ログイン・投稿するモジュール。
-reCAPTCHAを回避するため、ブラウザログインは行わずクッキーを直接セットする。
-GitHub Actions環境（ヘッドレス）でも動作するように設計。
+
+【正しい投稿フロー】
+1. 楽天市場の商品ページにアクセス
+2. 「ROOMに投稿」ボタンをクリック（新しいタブで投稿ページが開く）
+3. テキストエリアにキャプションを入力
+4. 「完了」ボタンをクリック
 """
 
 import os
 import json
 import time
-import requests
-import tempfile
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-# 環境変数から認証情報を取得
 RAKUTEN_COOKIES_JSON = os.environ.get("RAKUTEN_COOKIES", "")
-
-# 楽天RoomのURL
 RAKUTEN_ROOM_URL = "https://room.rakuten.co.jp"
-RAKUTEN_ROOM_POST_URL = "https://room.rakuten.co.jp/post/new"
 
 
-def download_image(url: str ) -> str | None:
-    try:
-        high_res_url = url.replace("128x128", "500x500").replace("_ex=128x128", "_ex=500x500")
-        response = requests.get(high_res_url, timeout=15)
-        response.raise_for_status()
-        suffix = ".jpg"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-            f.write(response.content)
-            return f.name
-    except Exception as e:
-        print(f"[WARN] 画像ダウンロード失敗: {e}")
-        return None
-
-
-def load_cookies() -> list:
+def load_cookies( ) -> list:
     if not RAKUTEN_COOKIES_JSON:
         raise ValueError("環境変数 RAKUTEN_COOKIES が設定されていません。")
     cookies_raw = json.loads(RAKUTEN_COOKIES_JSON)
@@ -65,7 +49,6 @@ def load_cookies() -> list:
 
 
 def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
-    image_path = None
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -91,11 +74,11 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
 
         page = context.new_page()
         try:
+            # Step 1: 楽天Roomにアクセスしてログイン確認
             print("[INFO] 楽天Roomにアクセス中...")
             page.goto(RAKUTEN_ROOM_URL, wait_until="domcontentloaded", timeout=60000)
             time.sleep(3)
             print(f"[INFO] 現在のURL: {page.url}")
-
             if "login" in page.url.lower() or "nid" in page.url.lower():
                 print("[ERROR] クッキーが無効です。再度クッキーをエクスポートしてください。")
                 page.screenshot(path="/tmp/debug_login_failed.png")
@@ -103,106 +86,126 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                 return False
             print("[INFO] ログイン確認済み")
 
-            image_url = product_info.get("image_url", "")
-            if image_url:
-                image_path = download_image(image_url)
-                print(f"[INFO] 画像ダウンロード: {image_path}")
-
-            print("[INFO] 投稿ページへ移動中...")
-            page.goto(RAKUTEN_ROOM_POST_URL, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(3)
-            page.screenshot(path="/tmp/debug_post_page.png")
-            print(f"[INFO] 投稿ページURL: {page.url}")
-
-            if "login" in page.url.lower() or "nid" in page.url.lower():
-                print("[ERROR] 投稿ページへのアクセスに失敗。クッキーが期限切れの可能性があります。")
-                browser.close()
-                return False
-
+            # Step 2: 楽天市場の商品ページにアクセス
             item_url = product_info.get("item_url", "")
-            print(f"[INFO] 商品URL入力: {item_url[:60]}...")
-            url_input_selectors = [
-                'input[placeholder*="URL"]',
-                'input[placeholder*="url"]',
-                'input[placeholder*="商品"]',
-                'input[placeholder*="楽天"]',
-                'input[name*="url"]',
-                'input[name*="item"]',
-                'input[type="url"]',
-                'input[type="text"]',
+            print(f"[INFO] 商品ページにアクセス中: {item_url[:80]}...")
+            page.goto(item_url, wait_until="domcontentloaded", timeout=60000)
+            time.sleep(3)
+            page.screenshot(path="/tmp/debug_item_page.png")
+            print(f"[INFO] 商品ページURL: {page.url}")
+
+            # Step 3: 「ROOMに投稿」ボタンをクリック
+            print("[INFO] 「ROOMに投稿」ボタンを探しています...")
+            room_button_selectors = [
+                'a:has-text("ROOMに投稿")',
+                'a[href*="room.rakuten.co.jp/mix/collect"]',
+                'a[href*="mix/collect"]',
+                'a:has-text("ROOM")',
             ]
-            url_entered = False
-            for selector in url_input_selectors:
+            room_button_found = False
+            post_page = None
+            for selector in room_button_selectors:
                 try:
                     element = page.locator(selector).first
-                    if element.is_visible(timeout=3000):
-                        element.fill(item_url)
-                        time.sleep(1)
-                        element.press("Enter")
+                    if element.is_visible(timeout=5000):
+                        print(f"[INFO] 「ROOMに投稿」ボタン発見: {selector}")
+                        with context.expect_page(timeout=15000) as new_page_info:
+                            element.click()
+                        post_page = new_page_info.value
+                        post_page.wait_for_load_state("domcontentloaded", timeout=60000)
                         time.sleep(3)
-                        print(f"[INFO] 商品URL入力成功: {selector}")
-                        url_entered = True
+                        room_button_found = True
+                        print(f"[INFO] 投稿ページが開きました: {post_page.url}")
                         break
-                except Exception:
+                except Exception as ex:
+                    print(f"[DEBUG] セレクタ {selector} 失敗: {ex}")
                     continue
-            if not url_entered:
-                print("[WARN] 商品URL入力欄が見つかりませんでした。")
-                page.screenshot(path="/tmp/debug_no_url_input.png")
 
+            if not room_button_found:
+                # 直接URLを構築してアクセス
+                print("[WARN] 「ROOMに投稿」ボタンが見つかりませんでした。直接URLを構築します...")
+                page.screenshot(path="/tmp/debug_no_room_button.png")
+                item_code_full = product_info.get("item_code_full", "")
+                shop_code = product_info.get("shop_code", "")
+                item_code = product_info.get("item_code", "")
+                if item_code_full:
+                    collect_url = f"https://room.rakuten.co.jp/mix/collect?itemcode={item_code_full}&scid=we_room_upc60"
+                elif shop_code and item_code:
+                    collect_url = f"https://room.rakuten.co.jp/mix/collect?itemcode={shop_code}:{item_code}&scid=we_room_upc60"
+                else:
+                    print("[ERROR] itemcodeが取得できませんでした 。")
+                    browser.close()
+                    return False
+                print(f"[INFO] 投稿URLに直接アクセス: {collect_url}")
+                post_page = context.new_page()
+                post_page.goto(collect_url, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(3)
+                print(f"[INFO] 投稿ページURL: {post_page.url}")
+
+            # Step 4: キャプション入力
             print("[INFO] キャプション入力中...")
+            post_page.screenshot(path="/tmp/debug_post_page.png")
             caption_selectors = [
+                'textarea[placeholder*="オススメ"]',
                 'textarea[placeholder*="コメント"]',
                 'textarea[placeholder*="テキスト"]',
                 'textarea[placeholder*="説明"]',
-                'textarea[name*="comment"]',
-                'textarea[name*="caption"]',
-                'textarea[name*="text"]',
                 'textarea',
                 '[contenteditable="true"]',
             ]
+            caption_entered = False
             for selector in caption_selectors:
                 try:
-                    element = page.locator(selector).first
-                    if element.is_visible(timeout=3000):
+                    element = post_page.locator(selector).first
+                    if element.is_visible(timeout=5000):
+                        element.click()
+                        time.sleep(0.5)
                         element.fill(caption)
                         time.sleep(1)
                         print(f"[INFO] キャプション入力成功: {selector}")
+                        caption_entered = True
                         break
                 except Exception:
                     continue
+            if not caption_entered:
+                print("[WARN] キャプション入力欄が見つかりませんでした。")
+                post_page.screenshot(path="/tmp/debug_no_caption.png")
 
-            page.screenshot(path="/tmp/debug_before_submit.png")
-            print("[INFO] 投稿を実行中...")
+            post_page.screenshot(path="/tmp/debug_before_submit.png")
+
+            # Step 5: 「完了」ボタンをクリック
+            print("[INFO] 「完了」ボタンをクリック中...")
             submit_selectors = [
+                'button:has-text("完了")',
+                'a:has-text("完了")',
+                'input[value="完了"]',
                 'button[type="submit"]',
                 'button:has-text("投稿")',
                 'button:has-text("シェア")',
-                'button:has-text("公開")',
-                'button:has-text("保存")',
                 'input[type="submit"]',
             ]
             submitted = False
             for selector in submit_selectors:
                 try:
-                    element = page.locator(selector).first
-                    if element.is_visible(timeout=3000):
+                    element = post_page.locator(selector).first
+                    if element.is_visible(timeout=5000):
                         element.click()
-                        page.wait_for_load_state("domcontentloaded", timeout=60000)
+                        post_page.wait_for_load_state("domcontentloaded", timeout=60000)
                         time.sleep(3)
                         submitted = True
-                        print(f"[INFO] 投稿ボタンクリック: {selector}")
+                        print(f"[INFO] 「完了」ボタンクリック成功: {selector}")
                         break
                 except Exception:
                     continue
 
             if not submitted:
-                print("[ERROR] 投稿ボタンが見つかりませんでした。")
-                page.screenshot(path="/tmp/debug_no_submit.png")
+                print("[ERROR] 「完了」ボタンが見つかりませんでした。")
+                post_page.screenshot(path="/tmp/debug_no_submit.png")
                 browser.close()
                 return False
 
-            page.screenshot(path="/tmp/debug_after_submit.png")
-            print(f"[INFO] 投稿後URL: {page.url}")
+            post_page.screenshot(path="/tmp/debug_after_submit.png")
+            print(f"[INFO] 投稿後URL: {post_page.url}")
             print("[INFO] 投稿が完了しました！")
             browser.close()
             return True
@@ -223,9 +226,6 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                 pass
             browser.close()
             return False
-        finally:
-            if image_path and Path(image_path).exists():
-                Path(image_path).unlink()
 
 
 if __name__ == "__main__":
