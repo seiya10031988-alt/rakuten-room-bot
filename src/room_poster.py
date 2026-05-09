@@ -24,7 +24,7 @@ RAKUTEN_ROOM_POST_URL = "https://room.rakuten.co.jp/post/new"
 def download_image(url: str ) -> str | None:
     try:
         high_res_url = url.replace("128x128", "500x500").replace("_ex=128x128", "_ex=500x500")
-        response = requests.get(high_res_url, timeout=10)
+        response = requests.get(high_res_url, timeout=15)
         response.raise_for_status()
         suffix = ".jpg"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
@@ -92,9 +92,11 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
         page = context.new_page()
         try:
             print("[INFO] 楽天Roomにアクセス中...")
-            page.goto(RAKUTEN_ROOM_URL, wait_until="networkidle", timeout=30000)
-            time.sleep(2)
-            if "login" in page.url.lower():
+            page.goto(RAKUTEN_ROOM_URL, wait_until="domcontentloaded", timeout=60000)
+            time.sleep(3)
+            print(f"[INFO] 現在のURL: {page.url}")
+
+            if "login" in page.url.lower() or "nid" in page.url.lower():
                 print("[ERROR] クッキーが無効です。再度クッキーをエクスポートしてください。")
                 page.screenshot(path="/tmp/debug_login_failed.png")
                 browser.close()
@@ -107,7 +109,7 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                 print(f"[INFO] 画像ダウンロード: {image_path}")
 
             print("[INFO] 投稿ページへ移動中...")
-            page.goto(RAKUTEN_ROOM_POST_URL, wait_until="networkidle", timeout=30000)
+            page.goto(RAKUTEN_ROOM_POST_URL, wait_until="domcontentloaded", timeout=60000)
             time.sleep(3)
             page.screenshot(path="/tmp/debug_post_page.png")
             print(f"[INFO] 投稿ページURL: {page.url}")
@@ -185,7 +187,7 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                     element = page.locator(selector).first
                     if element.is_visible(timeout=3000):
                         element.click()
-                        page.wait_for_load_state("networkidle", timeout=30000)
+                        page.wait_for_load_state("domcontentloaded", timeout=60000)
                         time.sleep(3)
                         submitted = True
                         print(f"[INFO] 投稿ボタンクリック: {selector}")
