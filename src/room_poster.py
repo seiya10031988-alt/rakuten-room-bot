@@ -16,6 +16,9 @@ room_poster.py
   <span ng-show="!isSubmitted" class="ng-binding">完了</span>
 </button>
 → AngularJSアプリのため、通常クリックではなくJS経由でcollect()を呼び出す必要がある
+
+【正しい投稿URL形式】
+https://room.rakuten.co.jp/mix?itemcode={shop_code}:{item_code}&scid=we_room_upc60
 """
 
 import os
@@ -24,7 +27,7 @@ import time
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-RAKUTEN_COOKIES_JSON = os.environ.get("RAKUTEN_COOKIES", "")
+RAKUTEN_COOKIES_JSON = os.environ.get("RAKUTEN_COOKIES", "" )
 RAKUTEN_ROOM_URL = "https://room.rakuten.co.jp"
 
 
@@ -112,8 +115,8 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
             print("[INFO] 「ROOMに投稿」ボタンを探しています...")
             room_button_selectors = [
                 'a:has-text("ROOMに投稿")',
-                'a[href*="room.rakuten.co.jp/mix/collect"]',
-                'a[href*="mix/collect"]',
+                'a[href*="room.rakuten.co.jp/mix"]',
+                'a[href*="/mix?itemcode"]',
                 'a:has-text("ROOM")',
             ]
             room_button_found = False
@@ -143,9 +146,9 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                 item_code = product_info.get("item_code", "")
                 shop_code = product_info.get("shop_code", "")
                 if item_code_full:
-                    collect_url = f"https://room.rakuten.co.jp/mix/collect?itemcode={item_code_full}&scid=we_room_upc60"
+                    collect_url = f"https://room.rakuten.co.jp/mix?itemcode={item_code_full}&scid=we_room_upc60"
                 elif item_code and shop_code:
-                    collect_url = f"https://room.rakuten.co.jp/mix/collect?itemcode={shop_code}:{item_code}&scid=we_room_upc60"
+                    collect_url = f"https://room.rakuten.co.jp/mix?itemcode={shop_code}:{item_code}&scid=we_room_upc60"
                 else:
                     print("[ERROR] itemcodeが取得できませんでした 。")
                     browser.close()
