@@ -9,11 +9,12 @@ room_poster.py
 
 【修正履歴】
 - v6: 403エラーと「要求されたURL存在しません」の検知処理を追加
+- v7: 投稿後URLが変わらない場合を失敗と判定（"url_not_found"を返す）
+      「要求されたURL存在しません」の場合は投稿不可として"url_not_found"を返す
 """
 import os
 import json
 import time
-from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 RAKUTEN_COOKIES_JSON = os.environ.get("RAKUTEN_COOKIES", "")
@@ -67,7 +68,14 @@ def check_page_error(page) -> str:
     return ""
 
 
-def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
+def post_to_rakuten_room(product_info: dict, caption: str):
+    """
+    楽天ROOMに商品を投稿する。
+    戻り値:
+      True: 投稿成功
+      "url_not_found": 商品がROOMに投稿できない（別商品で再試行すべき）
+      False: その他の失敗
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -142,18 +150,10 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                             browser.close()
                             return False
                         elif page_error == "url_not_found":
-                            print("[WARN] 「要求されたURL存在しません」- 商品が存在しないか投稿不可です。")
+                            print("[WARN] 「要求されたURL存在しません」- この商品はROOMに投稿できません。")
                             post_page.screenshot(path="/tmp/debug_url_not_found.png")
-                            # 投稿フォームが表示されているか確認（ダイアログが出ても続行できる場合がある）
-                            try:
-                                # OKボタンがあればクリックして続行
-                                ok_btn = post_page.locator('button:has-text("OK"), input[value="OK"]').first
-                                if ok_btn.is_visible(timeout=3000):
-                                    ok_btn.click()
-                                    time.sleep(1)
-                                    print("[INFO] OKボタンをクリックして続行")
-                            except Exception:
-                                pass
+                            browser.close()
+                            return "url_not_found"
 
                         room_button_found = True
                         print(f"[INFO] 投稿ページが開きました: {post_page.url}")
@@ -191,17 +191,13 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                     browser.close()
                     return False
                 elif page_error == "url_not_found":
-                    print("[WARN] 「要求されたURL存在しません」- 商品が存在しないか投稿不可です。")
+                    print("[WARN] 「要求されたURL存在しません」- この商品はROOMに投稿できません。")
                     post_page.screenshot(path="/tmp/debug_url_not_found.png")
-                    # OKボタンがあればクリック
-                    try:
-                        ok_btn = post_page.locator('button:has-text("OK"), input[value="OK"]').first
-                        if ok_btn.is_visible(timeout=3000):
-                            ok_btn.click()
-                            time.sleep(1)
-                            print("[INFO] OKボタンをクリックして続行")
-                    except Exception:
-                        pass
+                    browser.close()
+                    return "url_not_found"
+
+            # 投稿前のURLを記録
+            url_before_submit = post_page.url
 
             # Step 4: キャプション入力
             print("[INFO] キャプション入力中...")
@@ -266,7 +262,33 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                 return False
 
             post_page.screenshot(path="/tmp/debug_after_submit.png")
-            print(f"[INFO] 投稿後URL: {post_page.url}")
+            url_after_submit = post_page.url
+            print(f"[INFO] 投稿後URL: {url_after_submit}")
+
+            # 投稿後のURLが変わったか確認（変わっていなければ投稿失敗）
+            if url_after_submit == url_before_submit:
+                print("[WARN] 投稿後のURLが変わっていません。投稿が実際には完了していない可能性があります。")
+                # ページ内容を確認
+                page_error = check_page_error(post_page)
+                if page_error == "url_not_found":
+                    print("[WARN] 「要求されたURL存在しません」- この商品はROOMに投稿できません。")
+                    browser.close()
+                    return "url_not_found"
+                # URLが変わっていないが「要求されたURL存在しません」でもない場合
+                # → 投稿は完了しているかもしれない（ROOMの仕様でリダイレクトしない場合がある）
+                # → ページタイトルや内容で確認
+                try:
+                    title = post_page.title()
+                    print(f"[INFO] ページタイトル: {title}")
+                    content = post_page.content()
+                    if "コレ！して投稿する" in content:
+                        print("[WARN] まだ投稿フォームが表示されています。投稿が完了していません。")
+                        browser.close()
+                        return "url_not_found"
+                except Exception:
+                    pass
+                print("[INFO] URLは変わっていませんが、投稿が完了した可能性があります。")
+
             print("[INFO] 投稿が完了しました！")
             browser.close()
             return True
