@@ -4,12 +4,14 @@ room_poster.py
 
 【正しい投稿フロー】
 1. 楽天市場の商品ページにアクセス
-2. 「ROOMに投稿」ボタンをクリック（新しいタブで投稿ページが開く）
-3. テキストエリアにキャプションを入力
-4. 「完了」ボタンをクリック
+2. 「ROOMに投稿」ボタンのhrefからitemcodeを取得
+3. ROOMの投稿ページ（/mix/collect?itemcode=数字ID）に直接アクセス
+4. textareaにキャプションを入力
+5. 「完了」ボタンをクリック
 
 【修正履歴】
-- v3: wait_for_selector でAngularJS初期化完了を確実に待つ（time.sleep固定待機を廃止）
+- v4: 「ROOMに投稿」ボタンのhref属性からitemcodeを取得（数字ID形式）
+- v3: wait_for_selectorでAngularJS初期化完了を確実に待機
 - v2: Run #6コードに完全復元（element.fill + is_visible方式）
 """
 
@@ -97,37 +99,59 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
             page.screenshot(path="/tmp/debug_item_page.png")
             print(f"[INFO] 商品ページURL: {page.url}")
 
-            # Step 3: 「ROOMに投稿」ボタンをクリック
-            print("[INFO] 「ROOMに投稿」ボタンを探しています...")
+            # Step 3: 「ROOMに投稿」ボタンのhrefからitemcodeを取得
+            print("[INFO] 「ROOMに投稿」ボタンのURLを取得中...")
+            collect_url = None
             room_button_selectors = [
                 'a:has-text("ROOMに投稿")',
                 'a[href*="room.rakuten.co.jp/mix/collect"]',
                 'a[href*="mix/collect"]',
                 'a:has-text("ROOM")',
             ]
-            room_button_found = False
-            post_page = None
             for selector in room_button_selectors:
                 try:
                     element = page.locator(selector).first
                     if element.is_visible(timeout=5000):
-                        print(f"[INFO] 「ROOMに投稿」ボタン発見: {selector}")
-                        with context.expect_page(timeout=15000) as new_page_info:
-                            element.click()
-                        post_page = new_page_info.value
-                        post_page.wait_for_load_state("domcontentloaded", timeout=60000)
-                        time.sleep(3)
-                        room_button_found = True
-                        print(f"[INFO] 投稿ページが開きました: {post_page.url}")
-                        break
+                        href = element.get_attribute("href")
+                        if href and "collect" in href:
+                            # hrefが相対URLの場合はフルURLに変換
+                            if href.startswith("//"):
+                                href = "https:" + href
+                            elif href.startswith("/"):
+                                href = "https://room.rakuten.co.jp" + href
+                            collect_url = href
+                            print(f"[INFO] 「ROOMに投稿」ボタン発見: {selector}")
+                            print(f"[INFO] 投稿URL取得: {collect_url}")
+                            break
                 except Exception as ex:
                     print(f"[DEBUG] セレクタ {selector} 失敗: {ex}")
                     continue
 
-            if not room_button_found:
-                # 直接URLを構築してアクセス
-                print("[WARN] 「ROOMに投稿」ボタンが見つかりませんでした。直接URLを構築します...")
+            if not collect_url:
+                # hrefが取得できない場合はJavaScriptでページ内のROOMリンクを探す
+                print("[WARN] 通常セレクタでURL取得失敗。JavaScriptで検索中...")
                 page.screenshot(path="/tmp/debug_no_room_button.png")
+                try:
+                    collect_url = page.evaluate("""
+                        () => {
+                            const links = document.querySelectorAll('a[href]');
+                            for (const link of links) {
+                                const href = link.href || link.getAttribute('href');
+                                if (href && href.includes('collect')) {
+                                    return href;
+                                }
+                            }
+                            return null;
+                        }
+                    """)
+                    if collect_url:
+                        print(f"[INFO] JavaScriptでURL取得: {collect_url}")
+                except Exception as e:
+                    print(f"[DEBUG] JavaScript検索失敗: {e}")
+
+            if not collect_url:
+                # 最終手段: item_code_fullから直接URLを構築
+                print("[WARN] URLが取得できませんでした。itemcodeから直接URLを構築します...")
                 item_code_full = product_info.get("item_code_full", "")
                 shop_code = product_info.get("shop_code", "")
                 item_code = product_info.get("item_code", "")
@@ -139,13 +163,30 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                     print("[ERROR] itemcodeが取得できませんでした。")
                     browser.close()
                     return False
-                print(f"[INFO] 投稿URLに直接アクセス: {collect_url}")
-                post_page = context.new_page()
-                post_page.goto(collect_url, wait_until="domcontentloaded", timeout=60000)
-                print(f"[INFO] 投稿ページURL: {post_page.url}")
+                print(f"[INFO] フォールバックURL: {collect_url}")
 
-            # Step 4: AngularJS初期化完了を待ってからキャプション入力
-            # wait_for_selectorでtextareaが実際に表示されるまで待機（最大30秒）
+            # Step 4: 投稿ページに直接アクセス
+            print(f"[INFO] 投稿ページにアクセス中: {collect_url}")
+            post_page = context.new_page()
+            post_page.goto(collect_url, wait_until="domcontentloaded", timeout=60000)
+            print(f"[INFO] 投稿ページURL: {post_page.url}")
+
+            # 403エラーチェック
+            page_content = post_page.content()
+            if "403" in page_content and "Forbidden" in page_content:
+                print("[ERROR] 403 Forbidden - 認証エラー。クッキーを更新してください。")
+                post_page.screenshot(path="/tmp/debug_403.png")
+                browser.close()
+                return False
+
+            # 「要求されたURL存在しません」チェック
+            if "要求されたURL存在しません" in page_content:
+                print("[ERROR] 投稿できない商品です（要求されたURL存在しません）。")
+                post_page.screenshot(path="/tmp/debug_url_not_found.png")
+                browser.close()
+                return False
+
+            # Step 5: AngularJS初期化完了を待ってからキャプション入力
             print("[INFO] 投稿フォームの読み込みを待機中...")
             try:
                 post_page.wait_for_selector(
@@ -189,7 +230,7 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
 
             post_page.screenshot(path="/tmp/debug_before_submit.png")
 
-            # Step 5: 「完了」ボタンをクリック
+            # Step 6: 「完了」ボタンをクリック
             print("[INFO] 「完了」ボタンをクリック中...")
             submit_selectors = [
                 'button:has-text("完了")',
