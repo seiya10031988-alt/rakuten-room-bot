@@ -1,14 +1,16 @@
 """
-room_poster.py v11
+room_poster.py v12
 クッキーを使って楽天Roomに自動ログイン・投稿するモジュール。
 
 【修正履歴】
+- v12: AngularJS初期化完了を待つ処理を追加。
+       商品画像が表示されるまで（item.nameが空でなくなるまで）最大30秒待機してから
+       キャプション入力・「完了」クリックを実行するように変更。
+       これにより「Name は空白ではいけません」エラーを解消。
 - v11: 投稿成功判定を修正。楽天ROOMはAjaxで投稿処理するためURLは変わらない。
        「完了」クリック後に「コレ！完了!」テキストまたは「my ROOMを見る」ボタンが
        表示されたら成功と判定するように変更。
 - v10: 楽天市場商品ページのHTMLから「ROOMに投稿」リンクのhref（数字itemcode）を取得する方式に変更
-       networkidleまで待機してからHTMLを解析
-       数字形式のitemcodeを使うことで商品画像が正常に表示され投稿が成功する
 """
 import os
 import json
@@ -53,21 +55,15 @@ def get_room_collect_url_from_item_page(page, item_url: str) -> str:
     """
     楽天市場の商品ページにアクセスし、「ROOMに投稿」ボタンのhrefから
     数字形式のitemcodeを含むROOM投稿URLを取得する。
-    
-    Returns:
-        str: ROOMの投稿URL（例: https://room.rakuten.co.jp/mix/collect?itemcode=1100052541980281&scid=we_room_upc60）
-        None: 取得失敗
     """
     print(f"[INFO] 商品ページにアクセス中: {item_url[:80]}...")
     
     try:
-        # networkidleまで待機してJavaScriptを完全に実行させる
         page.goto(item_url, wait_until="networkidle", timeout=60000)
     except Exception:
-        # networkidleがタイムアウトしても続行
         try:
             page.goto(item_url, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(5)  # JSの実行を待つ
+            time.sleep(5)
         except Exception as e:
             print(f"[ERROR] 商品ページのアクセスに失敗: {e}")
             return None
@@ -75,33 +71,7 @@ def get_room_collect_url_from_item_page(page, item_url: str) -> str:
     page.screenshot(path="/tmp/debug_item_page.png")
     print(f"[INFO] 商品ページURL: {page.url}")
     
-    # HTMLからROOM投稿URLを抽出
-    html = page.content()
-    
-    # パターン1: href属性から直接取得
-    patterns = [
-        r'href="(https://room\.rakuten\.co\.jp/mix/collect\?itemcode=[^"&]+[^"]*)"',
-        r"href='(https://room\.rakuten\.co\.jp/mix/collect\?itemcode=[^'&]+[^']*)'",
-        r'(https://room\.rakuten\.co\.jp/mix/collect\?itemcode=\d+[^"\'&\s]*)',
-        r'"(//room\.rakuten\.co\.jp/mix/collect\?itemcode=[^"]+)"',
-        # mix?itemcode形式（リダイレクト先が数字になる）
-        r'href="(https://room\.rakuten\.co\.jp/mix\?itemcode=[^"]+)"',
-        r"href='(https://room\.rakuten\.co\.jp/mix\?itemcode=[^']+)'",
-    ]
-    
-    for pattern in patterns:
-        matches = re.findall(pattern, html)
-        if matches:
-            url = matches[0]
-            if url.startswith("//"):
-                url = "https:" + url
-            # scidパラメータがない場合は追加
-            if "scid=" not in url:
-                url += "&scid=we_room_upc60"
-            print(f"[INFO] ROOMの投稿URL取得成功: {url}")
-            return url
-    
-    # パターン2: JavaScriptでリンクを探す
+    # JavaScriptでリンクを直接取得（ブラウザが&amp;を自動デコードするため正確なURLが取れる）
     try:
         room_links = page.evaluate("""
             () => {
@@ -117,6 +87,26 @@ def get_room_collect_url_from_item_page(page, item_url: str) -> str:
             return url
     except Exception as e:
         print(f"[DEBUG] JS経由の取得失敗: {e}")
+    
+    # フォールバック: HTMLから取得（&amp;をデコード）
+    import html as html_module
+    html_content = page.content()
+    patterns = [
+        r'href="(https://room\.rakuten\.co\.jp/mix/collect\?itemcode=[^"]+)"',
+        r"href='(https://room\.rakuten\.co\.jp/mix/collect\?itemcode=[^']+)'",
+        r'href="(https://room\.rakuten\.co\.jp/mix\?itemcode=[^"]+)"',
+        r"href='(https://room\.rakuten\.co\.jp/mix\?itemcode=[^']+)'",
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, html_content)
+        if matches:
+            url = html_module.unescape(matches[0])  # &amp; → & に変換
+            if url.startswith("//"):
+                url = "https:" + url
+            if "scid=" not in url:
+                url += "&scid=we_room_upc60"
+            print(f"[INFO] HTML解析でROOMの投稿URL取得成功: {url}")
+            return url
     
     # パターン3: 「ROOMに投稿」テキストを含むリンクを探す
     try:
@@ -137,6 +127,50 @@ def get_room_collect_url_from_item_page(page, item_url: str) -> str:
     
     print("[WARN] ROOMの投稿URLが見つかりませんでした。")
     return None
+
+
+def wait_for_angular_ready(post_page, max_wait=30) -> bool:
+    """
+    AngularJSの初期化完了を待つ。
+    item.nameが空でなくなるまで（商品データが読み込まれるまで）待機する。
+    
+    Returns:
+        True: 初期化完了
+        False: タイムアウト
+    """
+    print("[INFO] AngularJS初期化完了を待機中...")
+    for i in range(max_wait):
+        try:
+            result = post_page.evaluate("""
+                () => {
+                    try {
+                        const ngCtrl = document.querySelector('[ng-controller]');
+                        if (!ngCtrl) return {ready: false, reason: 'no ng-controller'};
+                        const scope = angular.element(ngCtrl).scope();
+                        if (!scope) return {ready: false, reason: 'no scope'};
+                        const item = scope.item;
+                        if (!item) return {ready: false, reason: 'no item'};
+                        const name = item.name || item.title || '';
+                        if (name && name.length > 0) {
+                            return {ready: true, name: name.substring(0, 30)};
+                        }
+                        return {ready: false, reason: 'item.name is empty', item_keys: Object.keys(item)};
+                    } catch(e) {
+                        return {ready: false, reason: e.message};
+                    }
+                }
+            """)
+            if result.get("ready"):
+                print(f"[INFO] AngularJS初期化完了: item.name='{result.get('name', '')}'")
+                return True
+            else:
+                print(f"[INFO] AngularJS待機中... ({i+1}/{max_wait}秒) reason={result.get('reason', '')}")
+        except Exception as e:
+            print(f"[DEBUG] AngularJS確認エラー: {e}")
+        time.sleep(1)
+    
+    print(f"[WARN] AngularJS初期化タイムアウト（{max_wait}秒）")
+    return False
 
 
 def post_to_rakuten_room(product_info: dict, caption: str):
@@ -216,10 +250,11 @@ def post_to_rakuten_room(product_info: dict, caption: str):
             # Step 3: ROOMの投稿ページにアクセス
             print(f"[INFO] ROOMの投稿ページにアクセス: {collect_url}")
             post_page = context.new_page()
-            # ダイアログハンドラを先に設定
             post_page.on("dialog", handle_dialog)
             post_page.goto(collect_url, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(5)  # AngularJSの初期化とダイアログが出るのを待つ
+            
+            # AngularJSの初期化完了を待つ（最大30秒）
+            angular_ready = wait_for_angular_ready(post_page, max_wait=30)
             
             post_page.screenshot(path="/tmp/debug_post_page.png")
             print(f"[INFO] 投稿ページURL: {post_page.url}")
@@ -239,7 +274,7 @@ def post_to_rakuten_room(product_info: dict, caption: str):
                 browser.close()
                 return False
 
-            # 「完了」ボタンが表示されているか確認（投稿フォームが正常に開いているか）
+            # 「完了」ボタンが表示されているか確認
             try:
                 submit_btn = post_page.locator('button:has-text("完了")').first
                 if not submit_btn.is_visible(timeout=10000):
@@ -253,32 +288,61 @@ def post_to_rakuten_room(product_info: dict, caption: str):
                 browser.close()
                 return "url_not_found"
 
-            dialog_messages.clear()  # ダイアログ履歴をリセット
+            # AngularJSが初期化されていない場合は投稿をスキップ
+            if not angular_ready:
+                print("[WARN] AngularJS初期化タイムアウト - この商品はスキップします。")
+                browser.close()
+                return "url_not_found"
+
+            dialog_messages.clear()
 
             # Step 4: キャプション入力
             print("[INFO] キャプション入力中...")
-            caption_selectors = [
-                'textarea[placeholder*="オススメ"]',
-                'textarea[placeholder*="コメント"]',
-                'textarea[placeholder*="テキスト"]',
-                'textarea[placeholder*="説明"]',
-                'textarea',
-                '[contenteditable="true"]',
-            ]
             caption_entered = False
-            for selector in caption_selectors:
-                try:
-                    element = post_page.locator(selector).first
-                    if element.is_visible(timeout=5000):
-                        element.click()
-                        time.sleep(0.5)
-                        element.fill(caption)
-                        time.sleep(1)
-                        print(f"[INFO] キャプション入力成功: {selector}")
-                        caption_entered = True
-                        break
-                except Exception:
-                    continue
+            
+            # AngularJSのスコープを直接更新する方法を試みる
+            try:
+                result = post_page.evaluate(f"""
+                    () => {{
+                        const ngCtrl = document.querySelector('[ng-controller]');
+                        if (!ngCtrl) return false;
+                        const scope = angular.element(ngCtrl).scope();
+                        if (!scope) return false;
+                        scope.$apply(function() {{
+                            scope.content = {json.dumps(caption)};
+                        }});
+                        return true;
+                    }}
+                """)
+                if result:
+                    print("[INFO] AngularJSスコープ経由でキャプション入力成功")
+                    caption_entered = True
+                    time.sleep(0.5)
+            except Exception as e:
+                print(f"[DEBUG] AngularJSスコープ経由の入力失敗: {e}")
+            
+            # フォールバック: 通常のテキスト入力
+            if not caption_entered:
+                caption_selectors = [
+                    'textarea[placeholder*="オススメ"]',
+                    'textarea[placeholder*="コメント"]',
+                    'textarea',
+                ]
+                for selector in caption_selectors:
+                    try:
+                        element = post_page.locator(selector).first
+                        if element.is_visible(timeout=5000):
+                            element.click()
+                            time.sleep(0.3)
+                            # fillの代わりにpress_sequentiallyを使う（AngularJSのng-modelを更新するため）
+                            element.press_sequentially(caption, delay=10)
+                            time.sleep(0.5)
+                            print(f"[INFO] キャプション入力成功（press_sequentially）: {selector}")
+                            caption_entered = True
+                            break
+                    except Exception:
+                        continue
+            
             if not caption_entered:
                 print("[WARN] キャプション入力欄が見つかりませんでした。")
                 post_page.screenshot(path="/tmp/debug_no_caption.png")
@@ -292,9 +356,6 @@ def post_to_rakuten_room(product_info: dict, caption: str):
                 'a:has-text("完了")',
                 'input[value="完了"]',
                 'button[type="submit"]',
-                'button:has-text("投稿")',
-                'button:has-text("シェア")',
-                'input[type="submit"]',
             ]
             submitted = False
             for selector in submit_selectors:
@@ -318,8 +379,7 @@ def post_to_rakuten_room(product_info: dict, caption: str):
             print("[INFO] 投稿完了を確認中...")
             success = False
             
-            # 最大15秒待つ
-            for i in range(15):
+            for i in range(20):
                 time.sleep(1)
                 try:
                     page_content = post_page.content()
@@ -334,25 +394,25 @@ def post_to_rakuten_room(product_info: dict, caption: str):
                     # 成功パターン2: 「my ROOMを見る」ボタンが表示される
                     try:
                         my_room_btn = post_page.locator('a:has-text("my ROOM を見る"), a:has-text("my ROOMを見る")').first
-                        if my_room_btn.is_visible(timeout=1000):
+                        if my_room_btn.is_visible(timeout=500):
                             print(f"[INFO] 「my ROOMを見る」ボタンを検知 - 投稿成功！")
                             success = True
                             break
                     except Exception:
                         pass
                     
-                    # 成功パターン3: URLが変わった場合（念のため）
+                    # 成功パターン3: URLが変わった場合
                     if current_url != collect_url and "collect" not in current_url:
                         print(f"[INFO] URLが変化 - 投稿成功！: {current_url}")
                         success = True
                         break
                     
                     # ダイアログで失敗が検知された場合
-                    if any("要求されたURL" in m or "存在しません" in m for m in dialog_messages):
-                        print("[WARN] 「完了」クリック後に「要求されたURL存在しません」ダイアログ検知")
+                    if any("要求されたURL" in m or "存在しません" in m or "空白" in m for m in dialog_messages):
+                        print(f"[WARN] エラーダイアログ検知: {dialog_messages}")
                         break
                     
-                    print(f"[INFO] 待機中... ({i+1}/15秒)")
+                    print(f"[INFO] 待機中... ({i+1}/20秒)")
                 except Exception as e:
                     print(f"[DEBUG] 確認中にエラー: {e}")
             
@@ -363,7 +423,11 @@ def post_to_rakuten_room(product_info: dict, caption: str):
                 browser.close()
                 return True
             else:
-                # ダイアログで失敗が検知された場合
+                if any("空白" in m for m in dialog_messages):
+                    print("[WARN] 「Name は空白ではいけません」エラー - AngularJS初期化が不完全でした。")
+                    browser.close()
+                    return "url_not_found"
+                
                 if any("要求されたURL" in m or "存在しません" in m for m in dialog_messages):
                     print("[WARN] この商品はROOMに投稿できません。別の商品で再試行します。")
                     browser.close()
