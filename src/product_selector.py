@@ -4,6 +4,7 @@ product_selector.py
 
 【修正履歴】
 - v2: itemcodeバリデーション追加（ferry:10000000 などの不正なitemcodeを除外）
+- v3: exclude_codesパラメータを追加（投稿失敗した商品を除外して再選定できる）
 """
 
 import os
@@ -20,7 +21,7 @@ RAKUTEN_AFFILIATE_ID = os.environ.get("RAKUTEN_AFFILIATE_ID", "")
 # 2026年4月更新の新エンドポイント
 RAKUTEN_ITEM_SEARCH_URL = "https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260401"
 
-# 季節ごとの検索キーワード（釣り・アウトドア ）
+# 季節ごとの検索キーワード（釣り・アウトドア）
 SEASONAL_KEYWORDS = {
     3: ["渓流釣り ルアー", "バス釣り ワーム", "テント 春 キャンプ", "釣り リール 春", "アウトドア チェア 軽量"],
     4: ["バス釣り ロッド", "渓流 フライフィッシング", "キャンプ 焚き火台", "釣り ウェーダー", "アウトドア クッカー"],
@@ -31,7 +32,7 @@ SEASONAL_KEYWORDS = {
     9: ["秋 青物 ショアジギング", "エギング タコ", "キャンプ 秋 シュラフ", "釣り ジグ 青物", "ハイキング リュック"],
     10: ["エギング イカ", "ショアジギング ロッド", "キャンプ 焚き火 秋", "釣り ライフジャケット", "アウトドア ランタン"],
     11: ["ヒラメ 釣り ルアー", "根魚 ロックフィッシュ", "キャンプ 冬支度", "釣り 防寒 グローブ", "アウトドア ダウン"],
-    12: ["ワカサギ 釣り セット", "船釣り タイラバ", "冬キャンプ シュラフ", "釣り 防寒 ウェア", "アウトドア ストーブ"],
+    12: ["ワカサギ 電動リール", "タイラバ 鯛ラバ", "冬キャンプ シュラフ", "釣り 防寒 ウェア", "アウトドア ストーブ"],
     1: ["ワカサギ 電動リール", "タイラバ 鯛ラバ", "冬キャンプ テント", "釣り 防寒 ブーツ", "アウトドア 薪ストーブ"],
     2: ["メバリング 冬 ロッド", "カレイ 投げ釣り", "キャンプ 春支度", "釣り 防寒 インナー", "アウトドア バーナー"],
 }
@@ -68,8 +69,7 @@ def is_valid_item_code(item_code_full: str) -> bool:
     for pattern in INVALID_ITEM_CODE_PATTERNS:
         if item_code == pattern:
             return False
-    # item_codeが数字のみで構成されているか確認（英数字混在も許可）
-    # 最低でも5文字以上あること
+    # item_codeが最低3文字以上あること
     if len(item_code) < 3:
         return False
     return True
@@ -117,11 +117,15 @@ def score_product(item: dict) -> float:
     return score
 
 
-def select_best_product() -> dict:
+def select_best_product(exclude_codes: list = None) -> dict:
     """
     季節キーワードから商品を検索し、スコアが最も高い商品を1件選定して返す。
     itemcodeが不正な商品は除外する。
+    exclude_codesに含まれるitemcodeの商品も除外する（再試行時に使用）。
     """
+    if exclude_codes is None:
+        exclude_codes = []
+
     keywords = get_seasonal_keywords()
     selected_keywords = random.sample(keywords, min(3, len(keywords)))
     all_items = []
@@ -137,6 +141,7 @@ def select_best_product() -> dict:
     seen = set()
     unique_items = []
     skipped = 0
+    excluded = 0
     for item in all_items:
         code = item.get("itemCode", "")
         if code and code not in seen:
@@ -145,11 +150,18 @@ def select_best_product() -> dict:
                 print(f"[WARN] 不正なitemcodeをスキップ: {code}")
                 skipped += 1
                 continue
+            # 除外リストチェック（投稿失敗した商品を除外）
+            if code in exclude_codes:
+                print(f"[INFO] 除外リストのためスキップ: {code}")
+                excluded += 1
+                continue
             seen.add(code)
             unique_items.append(item)
 
     if skipped > 0:
         print(f"[INFO] 不正なitemcodeを持つ商品を {skipped} 件スキップしました。")
+    if excluded > 0:
+        print(f"[INFO] 除外リストの商品を {excluded} 件スキップしました。")
 
     if not unique_items:
         print("[WARN] 有効なitemcodeを持つ商品が見つかりませんでした。")
