@@ -7,19 +7,22 @@ room_poster.py
 2. 「ROOMに投稿」ボタンをクリック（新しいタブで投稿ページが開く）
 3. テキストエリアにキャプションを入力
 4. 「完了」ボタンをクリック
+
+【修正履歴】
+- v3: wait_for_selector でAngularJS初期化完了を確実に待つ（time.sleep固定待機を廃止）
+- v2: Run #6コードに完全復元（element.fill + is_visible方式）
 """
 
 import os
 import json
 import time
-from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 RAKUTEN_COOKIES_JSON = os.environ.get("RAKUTEN_COOKIES", "")
 RAKUTEN_ROOM_URL = "https://room.rakuten.co.jp"
 
 
-def load_cookies( ) -> list:
+def load_cookies() -> list:
     if not RAKUTEN_COOKIES_JSON:
         raise ValueError("環境変数 RAKUTEN_COOKIES が設定されていません。")
     cookies_raw = json.loads(RAKUTEN_COOKIES_JSON)
@@ -31,7 +34,7 @@ def load_cookies( ) -> list:
             "domain": c["domain"],
             "path": c.get("path", "/"),
             "secure": c.get("secure", False),
-            "httpOnly": c.get("httpOnly", False ),
+            "httpOnly": c.get("httpOnly", False),
         }
         same_site = c.get("sameSite")
         if same_site == "no_restriction":
@@ -133,18 +136,31 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                 elif shop_code and item_code:
                     collect_url = f"https://room.rakuten.co.jp/mix/collect?itemcode={shop_code}:{item_code}&scid=we_room_upc60"
                 else:
-                    print("[ERROR] itemcodeが取得できませんでした 。")
+                    print("[ERROR] itemcodeが取得できませんでした。")
                     browser.close()
                     return False
                 print(f"[INFO] 投稿URLに直接アクセス: {collect_url}")
                 post_page = context.new_page()
                 post_page.goto(collect_url, wait_until="domcontentloaded", timeout=60000)
-                time.sleep(3)
                 print(f"[INFO] 投稿ページURL: {post_page.url}")
 
-            # Step 4: キャプション入力
-            print("[INFO] キャプション入力中...")
+            # Step 4: AngularJS初期化完了を待ってからキャプション入力
+            # wait_for_selectorでtextareaが実際に表示されるまで待機（最大30秒）
+            print("[INFO] 投稿フォームの読み込みを待機中...")
+            try:
+                post_page.wait_for_selector(
+                    'textarea[placeholder*="オススメ"], textarea[placeholder*="コメント"], textarea',
+                    state="visible",
+                    timeout=30000
+                )
+                print("[INFO] 投稿フォーム読み込み完了")
+            except PlaywrightTimeoutError:
+                print("[WARN] 投稿フォームの待機タイムアウト。スクリーンショットを保存します。")
+                post_page.screenshot(path="/tmp/debug_form_timeout.png")
+
             post_page.screenshot(path="/tmp/debug_post_page.png")
+
+            print("[INFO] キャプション入力中...")
             caption_selectors = [
                 'textarea[placeholder*="オススメ"]',
                 'textarea[placeholder*="コメント"]',
@@ -231,4 +247,3 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
 if __name__ == "__main__":
     print("[INFO] room_poster.py の動作確認")
     print(f"[INFO] RAKUTEN_COOKIES: {'設定済み' if RAKUTEN_COOKIES_JSON else '未設定'}")
-
