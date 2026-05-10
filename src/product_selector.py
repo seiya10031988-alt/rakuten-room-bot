@@ -5,6 +5,7 @@ product_selector.py
 【修正履歴】
 - v2: itemcodeバリデーション追加（ferry:10000000 などの不正なitemcodeを除外）
 - v3: exclude_codesパラメータを追加（投稿失敗した商品を除外して再選定できる）
+- v4: ブラックリストショップを追加（vanilla-vague, ferry など投稿できないショップを除外）
 """
 
 import os
@@ -44,6 +45,12 @@ INVALID_ITEM_CODE_PATTERNS = [
     "99999999",  # ダミー値
 ]
 
+# 楽天ROOMに投稿できないショップコードのブラックリスト
+BLACKLISTED_SHOP_CODES = [
+    "vanilla-vague",  # 「要求されたURL存在しません」エラーが発生するショップ
+    "ferry",          # 不正なitemcode（ferry:10000000）を返すショップ
+]
+
 
 def get_seasonal_keywords() -> list:
     """現在の月に応じた季節キーワードリストを返す。"""
@@ -56,6 +63,7 @@ def is_valid_item_code(item_code_full: str) -> bool:
     itemcodeが有効かどうかを検証する。
     - shop_code:item_code 形式であること
     - item_codeが不正なダミー値でないこと
+    - ショップコードがブラックリストに含まれていないこと
     """
     if not item_code_full or ":" not in item_code_full:
         return False
@@ -64,6 +72,9 @@ def is_valid_item_code(item_code_full: str) -> bool:
         return False
     shop_code, item_code = parts
     if not shop_code or not item_code:
+        return False
+    # ブラックリストチェック
+    if shop_code in BLACKLISTED_SHOP_CODES:
         return False
     # ダミー値チェック
     for pattern in INVALID_ITEM_CODE_PATTERNS:
@@ -120,7 +131,7 @@ def score_product(item: dict) -> float:
 def select_best_product(exclude_codes: list = None) -> dict:
     """
     季節キーワードから商品を検索し、スコアが最も高い商品を1件選定して返す。
-    itemcodeが不正な商品は除外する。
+    itemcodeが不正な商品・ブラックリストのショップは除外する。
     exclude_codesに含まれるitemcodeの商品も除外する（再試行時に使用）。
     """
     if exclude_codes is None:
@@ -145,9 +156,13 @@ def select_best_product(exclude_codes: list = None) -> dict:
     for item in all_items:
         code = item.get("itemCode", "")
         if code and code not in seen:
-            # itemcodeバリデーション
+            # itemcodeバリデーション（ブラックリストチェック含む）
             if not is_valid_item_code(code):
-                print(f"[WARN] 不正なitemcodeをスキップ: {code}")
+                shop_code = code.split(":")[0] if ":" in code else ""
+                if shop_code in BLACKLISTED_SHOP_CODES:
+                    print(f"[INFO] ブラックリストショップのためスキップ: {code}")
+                else:
+                    print(f"[WARN] 不正なitemcodeをスキップ: {code}")
                 skipped += 1
                 continue
             # 除外リストチェック（投稿失敗した商品を除外）
@@ -159,7 +174,7 @@ def select_best_product(exclude_codes: list = None) -> dict:
             unique_items.append(item)
 
     if skipped > 0:
-        print(f"[INFO] 不正なitemcodeを持つ商品を {skipped} 件スキップしました。")
+        print(f"[INFO] 不正/ブラックリストのitemcodeを持つ商品を {skipped} 件スキップしました。")
     if excluded > 0:
         print(f"[INFO] 除外リストの商品を {excluded} 件スキップしました。")
 
