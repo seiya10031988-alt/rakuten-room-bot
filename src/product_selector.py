@@ -1,6 +1,9 @@
 """
 product_selector.py
 楽天市場APIで釣り・アウトドア関連商品を季節に応じて自動検索・選定するモジュール。
+
+【修正履歴】
+- v2: itemcodeバリデーション追加（ferry:10000000 などの不正なitemcodeを除外）
 """
 
 import os
@@ -9,7 +12,7 @@ import random
 import requests
 from datetime import datetime
 
-# ── 定数 ──────────────────────────────────────────────
+# ── 定数 ──────────────────────────────────────────────────────────────────────
 RAKUTEN_APP_ID = os.environ.get("RAKUTEN_APP_ID", "")
 RAKUTEN_ACCESS_KEY = os.environ.get("RAKUTEN_ACCESS_KEY", "")
 RAKUTEN_AFFILIATE_ID = os.environ.get("RAKUTEN_AFFILIATE_ID", "")
@@ -33,11 +36,43 @@ SEASONAL_KEYWORDS = {
     2: ["メバリング 冬 ロッド", "カレイ 投げ釣り", "キャンプ 春支度", "釣り 防寒 インナー", "アウトドア バーナー"],
 }
 
+# 不正なitemcodeのパターン（除外対象）
+INVALID_ITEM_CODE_PATTERNS = [
+    "10000000",  # ダミー値
+    "00000000",  # ダミー値
+    "99999999",  # ダミー値
+]
+
 
 def get_seasonal_keywords() -> list:
     """現在の月に応じた季節キーワードリストを返す。"""
     month = datetime.now().month
     return SEASONAL_KEYWORDS.get(month, ["釣り 人気", "アウトドア おすすめ"])
+
+
+def is_valid_item_code(item_code_full: str) -> bool:
+    """
+    itemcodeが有効かどうかを検証する。
+    - shop_code:item_code 形式であること
+    - item_codeが不正なダミー値でないこと
+    """
+    if not item_code_full or ":" not in item_code_full:
+        return False
+    parts = item_code_full.split(":", 1)
+    if len(parts) != 2:
+        return False
+    shop_code, item_code = parts
+    if not shop_code or not item_code:
+        return False
+    # ダミー値チェック
+    for pattern in INVALID_ITEM_CODE_PATTERNS:
+        if item_code == pattern:
+            return False
+    # item_codeが数字のみで構成されているか確認（英数字混在も許可）
+    # 最低でも5文字以上あること
+    if len(item_code) < 3:
+        return False
+    return True
 
 
 def search_products(keyword: str, hits: int = 10, sort: str = "-reviewCount") -> list:
@@ -60,7 +95,7 @@ def search_products(keyword: str, hits: int = 10, sort: str = "-reviewCount") ->
         "Origin": "https://rakuten.co.jp",
     }
     try:
-        response = requests.get(RAKUTEN_ITEM_SEARCH_URL, params=params, headers=headers, timeout=10 )
+        response = requests.get(RAKUTEN_ITEM_SEARCH_URL, params=params, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
         return data.get("Items", [])
@@ -85,6 +120,7 @@ def score_product(item: dict) -> float:
 def select_best_product() -> dict:
     """
     季節キーワードから商品を検索し、スコアが最も高い商品を1件選定して返す。
+    itemcodeが不正な商品は除外する。
     """
     keywords = get_seasonal_keywords()
     selected_keywords = random.sample(keywords, min(3, len(keywords)))
@@ -100,11 +136,24 @@ def select_best_product() -> dict:
 
     seen = set()
     unique_items = []
+    skipped = 0
     for item in all_items:
         code = item.get("itemCode", "")
         if code and code not in seen:
+            # itemcodeバリデーション
+            if not is_valid_item_code(code):
+                print(f"[WARN] 不正なitemcodeをスキップ: {code}")
+                skipped += 1
+                continue
             seen.add(code)
             unique_items.append(item)
+
+    if skipped > 0:
+        print(f"[INFO] 不正なitemcodeを持つ商品を {skipped} 件スキップしました。")
+
+    if not unique_items:
+        print("[WARN] 有効なitemcodeを持つ商品が見つかりませんでした。")
+        return None
 
     unique_items.sort(key=score_product, reverse=True)
     best = unique_items[0]
