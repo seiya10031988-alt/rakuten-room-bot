@@ -1,5 +1,4 @@
 name: 楽天Room 自動投稿
-
 on:
   schedule:
     # 1回目: 毎日 12:00 JST (= 03:00 UTC) に実行
@@ -11,30 +10,29 @@ on:
   workflow_dispatch:
     # 手動実行も可能（テスト用）
 
+permissions:
+  contents: write  # data/posted_items.json の書き込みに必要
+
 jobs:
   post:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       # ── リポジトリのチェックアウト ──────────────────────
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v4
-
       # ── Python環境のセットアップ ─────────────────────────
       - name: Python 3.11 セットアップ
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-
       # ── 依存パッケージのインストール ─────────────────────
       - name: 依存パッケージをインストール
         run: |
           pip install -r requirements.txt
           playwright install chromium
           playwright install-deps chromium
-
       # ── 自動投稿スクリプトの実行 ─────────────────────────
       - name: 楽天Room自動投稿を実行
         env:
@@ -43,10 +41,11 @@ jobs:
           RAKUTEN_AFFILIATE_ID: ${{ secrets.RAKUTEN_AFFILIATE_ID }}
           RAKUTEN_COOKIES: ${{ secrets.RAKUTEN_COOKIES }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           cd src
           python main.py
-
       # ── 失敗時のデバッグ情報保存 ─────────────────────────
       - name: デバッグスクリーンショットを保存（失敗時のみ）
         if: failure()
