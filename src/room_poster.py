@@ -294,18 +294,15 @@ def post_to_rakuten_room(product_info: dict, caption: str):
 
             # 投稿後のURLが変わったか確認
             if url_after_submit == url_before_submit:
-                print("[WARN] 投稿後のURLが変わっていません。")
-                # ページ内容を確認
+                print("[WARN] 投稿後のURLが変わっていません。投稿が完了していません。")
                 try:
-                    content = post_page.content()
-                    if "コレ！して投稿する" in content:
-                        print("[WARN] まだ投稿フォームが表示されています。投稿が完了していません。")
-                        browser.close()
-                        return "url_not_found"
                     title = post_page.title()
                     print(f"[INFO] ページタイトル: {title}")
+                    post_page.screenshot(path="/tmp/debug_url_unchanged.png")
                 except Exception:
                     pass
+                browser.close()
+                return "url_not_found"
 
             print("[INFO] 投稿が完了しました！")
             browser.close()
