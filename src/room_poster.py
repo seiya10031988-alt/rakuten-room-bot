@@ -3,31 +3,23 @@ room_poster.py
 クッキーを使って楽天Roomに自動ログイン・投稿するモジュール。
 
 【正しい投稿フロー】
-1. 楽天Roomにアクセスしてクッキーでログイン確認
-2. 楽天市場の商品ページにアクセス
-3. 「ROOMに投稿」ボタンのhrefからitemcodeを取得して投稿URLを構築
-4. 投稿ページにアクセスしてAngularJSの初期化を待つ
-5. JavaScriptでtextareaにキャプションを設定してAngularJSのng-modelを更新
-6. JavaScriptで「完了」ボタンをクリック（disabled属性を除去してから）
-
-【重要な知見】
-- Playwrightの通常click()はdisabledな要素（ng-disabled含む）をクリックできない（Timeout 30000ms）
-- textareaもボタンも「見つかっているがclickable/interactableでない」状態になる
-- 解決策: すべての操作をJavaScript（page.evaluate）で直接行う
-- AngularJSのng-modelを更新するには: valueを設定 → inputイベント発火 → changeイベント発火
-- 「完了」ボタンクリック: disabled除去 → isCollectDisabled=false → JS click()
+1. 楽天市場の商品ページにアクセス
+2. 「ROOMに投稿」ボタンをクリック（新しいタブで投稿ページが開く）
+3. テキストエリアにキャプションを入力
+4. 「完了」ボタンをクリック
 """
 
 import os
 import json
 import time
+from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 RAKUTEN_COOKIES_JSON = os.environ.get("RAKUTEN_COOKIES", "")
 RAKUTEN_ROOM_URL = "https://room.rakuten.co.jp"
 
 
-def load_cookies() -> list:
+def load_cookies( ) -> list:
     if not RAKUTEN_COOKIES_JSON:
         raise ValueError("環境変数 RAKUTEN_COOKIES が設定されていません。")
     cookies_raw = json.loads(RAKUTEN_COOKIES_JSON)
@@ -39,7 +31,7 @@ def load_cookies() -> list:
             "domain": c["domain"],
             "path": c.get("path", "/"),
             "secure": c.get("secure", False),
-            "httpOnly": c.get("httpOnly", False),
+            "httpOnly": c.get("httpOnly", False ),
         }
         same_site = c.get("sameSite")
         if same_site == "no_restriction":
@@ -60,11 +52,7 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
@@ -74,7 +62,6 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
         )
-
         print("[INFO] クッキーをセット中...")
         try:
             cookies = load_cookies()
@@ -87,7 +74,7 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
 
         page = context.new_page()
         try:
-            # ── Step 1: 楽天Roomにアクセスしてログイン確認 ──────────
+            # Step 1: 楽天Roomにアクセスしてログイン確認
             print("[INFO] 楽天Roomにアクセス中...")
             page.goto(RAKUTEN_ROOM_URL, wait_until="domcontentloaded", timeout=60000)
             time.sleep(3)
@@ -99,198 +86,129 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                 return False
             print("[INFO] ログイン確認済み")
 
-            # ── Step 2: 楽天市場の商品ページにアクセス ──────────────
+            # Step 2: 楽天市場の商品ページにアクセス
             item_url = product_info.get("item_url", "")
             print(f"[INFO] 商品ページにアクセス中: {item_url[:80]}...")
             page.goto(item_url, wait_until="domcontentloaded", timeout=60000)
             time.sleep(3)
+            page.screenshot(path="/tmp/debug_item_page.png")
             print(f"[INFO] 商品ページURL: {page.url}")
 
-            # ── Step 3: 投稿URLを構築 ────────────────────────────
-            # まず「ROOMに投稿」ボタンのhrefからitemcodeを取得する
-            collect_url = None
-            try:
-                room_link = page.evaluate(
-                    """() => {
-                        const links = document.querySelectorAll('a');
-                        for (const link of links) {
-                            const href = link.href || '';
-                            if (href.includes('mix/collect') || href.includes('mix?itemcode')) {
-                                return href;
-                            }
-                            const text = link.textContent || '';
-                            if (text.includes('ROOMに投稿') || text.includes('ROOM')) {
-                                return href;
-                            }
-                        }
-                        return null;
-                    }"""
-                )
-                if room_link:
-                    print(f"[INFO] 「ROOMに投稿」リンク発見: {room_link[:80]}")
-                    collect_url = room_link
-            except Exception as ex:
-                print(f"[DEBUG] リンク取得失敗: {ex}")
+            # Step 3: 「ROOMに投稿」ボタンをクリック
+            print("[INFO] 「ROOMに投稿」ボタンを探しています...")
+            room_button_selectors = [
+                'a:has-text("ROOMに投稿")',
+                'a[href*="room.rakuten.co.jp/mix/collect"]',
+                'a[href*="mix/collect"]',
+                'a:has-text("ROOM")',
+            ]
+            room_button_found = False
+            post_page = None
+            for selector in room_button_selectors:
+                try:
+                    element = page.locator(selector).first
+                    if element.is_visible(timeout=5000):
+                        print(f"[INFO] 「ROOMに投稿」ボタン発見: {selector}")
+                        with context.expect_page(timeout=15000) as new_page_info:
+                            element.click()
+                        post_page = new_page_info.value
+                        post_page.wait_for_load_state("domcontentloaded", timeout=60000)
+                        time.sleep(3)
+                        room_button_found = True
+                        print(f"[INFO] 投稿ページが開きました: {post_page.url}")
+                        break
+                except Exception as ex:
+                    print(f"[DEBUG] セレクタ {selector} 失敗: {ex}")
+                    continue
 
-            if not collect_url:
-                # 直接URLを構築
+            if not room_button_found:
+                # 直接URLを構築してアクセス
+                print("[WARN] 「ROOMに投稿」ボタンが見つかりませんでした。直接URLを構築します...")
+                page.screenshot(path="/tmp/debug_no_room_button.png")
                 item_code_full = product_info.get("item_code_full", "")
-                item_code = product_info.get("item_code", "")
                 shop_code = product_info.get("shop_code", "")
+                item_code = product_info.get("item_code", "")
                 if item_code_full:
                     collect_url = f"https://room.rakuten.co.jp/mix/collect?itemcode={item_code_full}&scid=we_room_upc60"
-                elif item_code and shop_code:
+                elif shop_code and item_code:
                     collect_url = f"https://room.rakuten.co.jp/mix/collect?itemcode={shop_code}:{item_code}&scid=we_room_upc60"
                 else:
-                    print("[ERROR] itemcodeが取得できませんでした。")
+                    print("[ERROR] itemcodeが取得できませんでした 。")
                     browser.close()
                     return False
-                print(f"[WARN] 「ROOMに投稿」ボタンが見つかりませんでした。直接URLを構築します...")
+                print(f"[INFO] 投稿URLに直接アクセス: {collect_url}")
+                post_page = context.new_page()
+                post_page.goto(collect_url, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(3)
+                print(f"[INFO] 投稿ページURL: {post_page.url}")
 
-            # /mix?itemcode= 形式の場合は /mix/collect?itemcode= に変換
-            if "/mix?" in collect_url and "itemcode=" in collect_url:
-                collect_url = collect_url.replace("/mix?", "/mix/collect?")
-                print(f"[INFO] URLを変換: {collect_url[:80]}")
-
-            print(f"[INFO] 投稿URLにアクセス: {collect_url[:80]}")
-
-            # ── Step 4: 投稿ページにアクセス ────────────────────────
-            post_page = context.new_page()
-            post_page.goto(collect_url, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(15)  # AngularJSの完全な初期化を待つ（十分な時間）
-            print(f"[INFO] 投稿ページURL: {post_page.url}")
+            # Step 4: キャプション入力
+            print("[INFO] キャプション入力中...")
             post_page.screenshot(path="/tmp/debug_post_page.png")
+            caption_selectors = [
+                'textarea[placeholder*="オススメ"]',
+                'textarea[placeholder*="コメント"]',
+                'textarea[placeholder*="テキスト"]',
+                'textarea[placeholder*="説明"]',
+                'textarea',
+                '[contenteditable="true"]',
+            ]
+            caption_entered = False
+            for selector in caption_selectors:
+                try:
+                    element = post_page.locator(selector).first
+                    if element.is_visible(timeout=5000):
+                        element.click()
+                        time.sleep(0.5)
+                        element.fill(caption)
+                        time.sleep(1)
+                        print(f"[INFO] キャプション入力成功: {selector}")
+                        caption_entered = True
+                        break
+                except Exception:
+                    continue
+            if not caption_entered:
+                print("[WARN] キャプション入力欄が見つかりませんでした。")
+                post_page.screenshot(path="/tmp/debug_no_caption.png")
 
-            # AngularJSの初期化状態を確認
-            angular_ready = post_page.evaluate(
-                """() => {
-                    try {
-                        return typeof angular !== 'undefined' && angular.element(document.body).injector() !== null;
-                    } catch(e) {
-                        return false;
-                    }
-                }"""
-            )
-            print(f"[INFO] AngularJS初期化状態: {angular_ready}")
-
-            # ── Step 5: JavaScriptでキャプションを入力 ──────────────
-            # Playwrightのclick()は使わず、JSで直接操作する
-            print("[INFO] JavaScriptでキャプションを入力中...")
-            caption_escaped = caption.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
-            caption_result = post_page.evaluate(
-                f"""() => {{
-                    try {{
-                        // textareaを探す
-                        const textarea = document.querySelector('#collect-content') ||
-                                        document.querySelector('textarea[ng-model]') ||
-                                        document.querySelector('textarea');
-                        if (!textarea) return 'textarea not found';
-
-                        // AngularJSのスコープを取得してng-modelを更新
-                        const caption = `{caption_escaped}`;
-                        try {{
-                            const scope = angular.element(textarea).scope();
-                            if (scope) {{
-                                // ng-modelのパスを取得
-                                const ngModel = textarea.getAttribute('ng-model') || '';
-                                console.log('ng-model:', ngModel);
-
-                                // $parentのcontentを設定
-                                if (ngModel.includes('$parent.content')) {{
-                                    scope.$parent.content = caption;
-                                }} else {{
-                                    scope.content = caption;
-                                }}
-                                scope.$apply();
-                                console.log('AngularJS scope updated');
-                            }}
-                        }} catch(e) {{
-                            console.log('AngularJS scope update failed: ' + e.message);
-                        }}
-
-                        // DOMのvalueも直接設定
-                        textarea.value = caption;
-
-                        // inputイベントを発火してAngularJSのng-modelを更新
-                        const inputEvent = new Event('input', {{ bubbles: true }});
-                        textarea.dispatchEvent(inputEvent);
-                        const changeEvent = new Event('change', {{ bubbles: true }});
-                        textarea.dispatchEvent(changeEvent);
-
-                        return 'caption set: ' + caption.length + ' chars';
-                    }} catch(e) {{
-                        return 'error: ' + e.message;
-                    }}
-                }}"""
-            )
-            print(f"[INFO] キャプション入力結果: {caption_result}")
-
-            time.sleep(2)
             post_page.screenshot(path="/tmp/debug_before_submit.png")
 
-            # ── Step 6: JavaScriptで「完了」ボタンをクリック ──────────
-            print("[INFO] JavaScriptで「完了」ボタンをクリック中...")
-            click_result = post_page.evaluate(
-                """() => {
-                    try {
-                        // 「完了」ボタンを探す
-                        const btn = document.querySelector('button.collect-btn') ||
-                                   document.querySelector('button[ng-click="collect()"]') ||
-                                   document.querySelector('button.button-red');
-                        if (!btn) return 'button not found';
+            # Step 5: 「完了」ボタンをクリック
+            print("[INFO] 「完了」ボタンをクリック中...")
+            submit_selectors = [
+                'button:has-text("完了")',
+                'a:has-text("完了")',
+                'input[value="完了"]',
+                'button[type="submit"]',
+                'button:has-text("投稿")',
+                'button:has-text("シェア")',
+                'input[type="submit"]',
+            ]
+            submitted = False
+            for selector in submit_selectors:
+                try:
+                    element = post_page.locator(selector).first
+                    if element.is_visible(timeout=5000):
+                        element.click()
+                        post_page.wait_for_load_state("domcontentloaded", timeout=60000)
+                        time.sleep(3)
+                        submitted = True
+                        print(f"[INFO] 「完了」ボタンクリック成功: {selector}")
+                        break
+                except Exception:
+                    continue
 
-                        console.log('Button found:', btn.outerHTML.substring(0, 200));
-
-                        // disabled属性を除去
-                        btn.removeAttribute('disabled');
-                        btn.classList.remove('ng-disabled');
-
-                        // AngularJSのスコープでisCollectDisabledをfalseに設定
-                        try {
-                            const scope = angular.element(btn).scope();
-                            if (scope) {
-                                console.log('isCollectDisabled before:', scope.isCollectDisabled);
-                                console.log('isSubmitted before:', scope.isSubmitted);
-                                scope.isCollectDisabled = false;
-                                scope.isSubmitted = false;
-                                scope.$apply();
-                                console.log('AngularJS scope updated for button');
-                            }
-                        } catch(e) {
-                            console.log('AngularJS scope update failed: ' + e.message);
-                        }
-
-                        // JavaScriptでクリックイベントを発火
-                        const clickEvent = new MouseEvent('click', {
-                            bubbles: true,
-                            cancelable: true,
-                            view: window
-                        });
-                        btn.dispatchEvent(clickEvent);
-
-                        return 'button clicked: ' + btn.className;
-                    } catch(e) {
-                        return 'error: ' + e.message;
-                    }
-                }"""
-            )
-            print(f"[INFO] 「完了」ボタンクリック結果: {click_result}")
-
-            if "clicked" in str(click_result):
-                time.sleep(10)  # 投稿処理の完了を待つ
-                post_page.screenshot(path="/tmp/debug_after_submit.png")
-                final_url = post_page.url
-                print(f"[INFO] 投稿後URL: {final_url}")
-                print("[INFO] 投稿が完了しました！")
-                browser.close()
-                return True
-            else:
-                print(f"[ERROR] 「完了」ボタンのクリックに失敗しました: {click_result}")
-                post_page.screenshot(path="/tmp/debug_click_failed.png")
-                html_content = post_page.content()
-                print(f"[DEBUG] ページHTML（先頭3000文字）: {html_content[:3000]}")
+            if not submitted:
+                print("[ERROR] 「完了」ボタンが見つかりませんでした。")
+                post_page.screenshot(path="/tmp/debug_no_submit.png")
                 browser.close()
                 return False
+
+            post_page.screenshot(path="/tmp/debug_after_submit.png")
+            print(f"[INFO] 投稿後URL: {post_page.url}")
+            print("[INFO] 投稿が完了しました！")
+            browser.close()
+            return True
 
         except PlaywrightTimeoutError as e:
             print(f"[ERROR] タイムアウトエラー: {e}")
@@ -313,3 +231,4 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
 if __name__ == "__main__":
     print("[INFO] room_poster.py の動作確認")
     print(f"[INFO] RAKUTEN_COOKIES: {'設定済み' if RAKUTEN_COOKIES_JSON else '未設定'}")
+
