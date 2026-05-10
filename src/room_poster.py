@@ -1,14 +1,15 @@
 """
 room_poster.py
 クッキーを使って楽天Roomに自動ログイン・投稿するモジュール。
-
 【正しい投稿フロー】
 1. 楽天市場の商品ページにアクセス
 2. 「ROOMに投稿」ボタンをクリック（新しいタブで投稿ページが開く）
 3. テキストエリアにキャプションを入力
 4. 「完了」ボタンをクリック
-"""
 
+【修正履歴】
+- v6: 403エラーと「要求されたURL存在しません」の検知処理を追加
+"""
 import os
 import json
 import time
@@ -19,7 +20,7 @@ RAKUTEN_COOKIES_JSON = os.environ.get("RAKUTEN_COOKIES", "")
 RAKUTEN_ROOM_URL = "https://room.rakuten.co.jp"
 
 
-def load_cookies( ) -> list:
+def load_cookies() -> list:
     if not RAKUTEN_COOKIES_JSON:
         raise ValueError("環境変数 RAKUTEN_COOKIES が設定されていません。")
     cookies_raw = json.loads(RAKUTEN_COOKIES_JSON)
@@ -31,7 +32,7 @@ def load_cookies( ) -> list:
             "domain": c["domain"],
             "path": c.get("path", "/"),
             "secure": c.get("secure", False),
-            "httpOnly": c.get("httpOnly", False ),
+            "httpOnly": c.get("httpOnly", False),
         }
         same_site = c.get("sameSite")
         if same_site == "no_restriction":
@@ -46,6 +47,24 @@ def load_cookies( ) -> list:
             cookie["expires"] = int(c["expirationDate"])
         playwright_cookies.append(cookie)
     return playwright_cookies
+
+
+def check_page_error(page) -> str:
+    """
+    ページにエラーが表示されているか確認する。
+    エラーの種類を返す。エラーなしの場合は空文字を返す。
+    """
+    try:
+        content = page.content()
+        if "403 Forbidden" in content or "認証が失敗しました" in content:
+            return "403_forbidden"
+        if "要求されたURL存在しません" in content:
+            return "url_not_found"
+        if "ページが見つかりません" in content or "404" in content:
+            return "404_not_found"
+    except Exception:
+        pass
+    return ""
 
 
 def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
@@ -109,11 +128,33 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                     element = page.locator(selector).first
                     if element.is_visible(timeout=5000):
                         print(f"[INFO] 「ROOMに投稿」ボタン発見: {selector}")
-                        with context.expect_page(timeout=15000) as new_page_info:
+                        with context.expect_page() as new_page_info:
                             element.click()
                         post_page = new_page_info.value
                         post_page.wait_for_load_state("domcontentloaded", timeout=60000)
                         time.sleep(3)
+
+                        # 新しいページのエラーチェック
+                        page_error = check_page_error(post_page)
+                        if page_error == "403_forbidden":
+                            print("[ERROR] 403 Forbidden - クッキーを更新してください。")
+                            post_page.screenshot(path="/tmp/debug_403.png")
+                            browser.close()
+                            return False
+                        elif page_error == "url_not_found":
+                            print("[WARN] 「要求されたURL存在しません」- 商品が存在しないか投稿不可です。")
+                            post_page.screenshot(path="/tmp/debug_url_not_found.png")
+                            # 投稿フォームが表示されているか確認（ダイアログが出ても続行できる場合がある）
+                            try:
+                                # OKボタンがあればクリックして続行
+                                ok_btn = post_page.locator('button:has-text("OK"), input[value="OK"]').first
+                                if ok_btn.is_visible(timeout=3000):
+                                    ok_btn.click()
+                                    time.sleep(1)
+                                    print("[INFO] OKボタンをクリックして続行")
+                            except Exception:
+                                pass
+
                         room_button_found = True
                         print(f"[INFO] 投稿ページが開きました: {post_page.url}")
                         break
@@ -133,7 +174,7 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                 elif shop_code and item_code:
                     collect_url = f"https://room.rakuten.co.jp/mix/collect?itemcode={shop_code}:{item_code}&scid=we_room_upc60"
                 else:
-                    print("[ERROR] itemcodeが取得できませんでした 。")
+                    print("[ERROR] itemcodeが取得できませんでした。")
                     browser.close()
                     return False
                 print(f"[INFO] 投稿URLに直接アクセス: {collect_url}")
@@ -141,6 +182,26 @@ def post_to_rakuten_room(product_info: dict, caption: str) -> bool:
                 post_page.goto(collect_url, wait_until="domcontentloaded", timeout=60000)
                 time.sleep(3)
                 print(f"[INFO] 投稿ページURL: {post_page.url}")
+
+                # 直接アクセス時のエラーチェック
+                page_error = check_page_error(post_page)
+                if page_error == "403_forbidden":
+                    print("[ERROR] 403 Forbidden - クッキーを更新してください。")
+                    post_page.screenshot(path="/tmp/debug_403.png")
+                    browser.close()
+                    return False
+                elif page_error == "url_not_found":
+                    print("[WARN] 「要求されたURL存在しません」- 商品が存在しないか投稿不可です。")
+                    post_page.screenshot(path="/tmp/debug_url_not_found.png")
+                    # OKボタンがあればクリック
+                    try:
+                        ok_btn = post_page.locator('button:has-text("OK"), input[value="OK"]').first
+                        if ok_btn.is_visible(timeout=3000):
+                            ok_btn.click()
+                            time.sleep(1)
+                            print("[INFO] OKボタンをクリックして続行")
+                    except Exception:
+                        pass
 
             # Step 4: キャプション入力
             print("[INFO] キャプション入力中...")
