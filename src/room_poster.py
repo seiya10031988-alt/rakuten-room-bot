@@ -1,8 +1,11 @@
 """
-room_poster.py v10
+room_poster.py v11
 クッキーを使って楽天Roomに自動ログイン・投稿するモジュール。
 
 【修正履歴】
+- v11: 投稿成功判定を修正。楽天ROOMはAjaxで投稿処理するためURLは変わらない。
+       「完了」クリック後に「コレ！完了!」テキストまたは「my ROOMを見る」ボタンが
+       表示されたら成功と判定するように変更。
 - v10: 楽天市場商品ページのHTMLから「ROOMに投稿」リンクのhref（数字itemcode）を取得する方式に変更
        networkidleまで待機してからHTMLを解析
        数字形式のitemcodeを使うことで商品画像が正常に表示され投稿が成功する
@@ -81,6 +84,9 @@ def get_room_collect_url_from_item_page(page, item_url: str) -> str:
         r"href='(https://room\.rakuten\.co\.jp/mix/collect\?itemcode=[^'&]+[^']*)'",
         r'(https://room\.rakuten\.co\.jp/mix/collect\?itemcode=\d+[^"\'&\s]*)',
         r'"(//room\.rakuten\.co\.jp/mix/collect\?itemcode=[^"]+)"',
+        # mix?itemcode形式（リダイレクト先が数字になる）
+        r'href="(https://room\.rakuten\.co\.jp/mix\?itemcode=[^"]+)"',
+        r"href='(https://room\.rakuten\.co\.jp/mix\?itemcode=[^']+)'",
     ]
     
     for pattern in patterns:
@@ -99,7 +105,7 @@ def get_room_collect_url_from_item_page(page, item_url: str) -> str:
     try:
         room_links = page.evaluate("""
             () => {
-                const links = Array.from(document.querySelectorAll('a[href*="room.rakuten.co.jp/mix/collect"]'));
+                const links = Array.from(document.querySelectorAll('a[href*="room.rakuten.co.jp/mix"]'));
                 return links.map(l => l.href);
             }
         """)
@@ -120,6 +126,8 @@ def get_room_collect_url_from_item_page(page, item_url: str) -> str:
             if href:
                 if href.startswith("//"):
                     href = "https:" + href
+                if href.startswith("/"):
+                    href = "https://room.rakuten.co.jp" + href
                 if "scid=" not in href:
                     href += "&scid=we_room_upc60"
                 print(f"[INFO] テキスト検索でROOMの投稿URL取得成功: {href}")
@@ -231,19 +239,20 @@ def post_to_rakuten_room(product_info: dict, caption: str):
                 browser.close()
                 return False
 
-            # 商品画像が表示されているか確認（img要素が存在するか）
+            # 「完了」ボタンが表示されているか確認（投稿フォームが正常に開いているか）
             try:
-                img_count = post_page.evaluate("() => document.querySelectorAll('.collect-item-image img, .item-image img, img[src*=\"thumbnail\"], img[src*=\"item\"]').length")
-                print(f"[INFO] 商品画像数: {img_count}")
-                if img_count == 0:
-                    # より広いセレクタで確認
-                    all_imgs = post_page.evaluate("() => document.querySelectorAll('img').length")
-                    print(f"[INFO] ページ内の全img数: {all_imgs}")
-            except Exception:
-                pass
+                submit_btn = post_page.locator('button:has-text("完了")').first
+                if not submit_btn.is_visible(timeout=10000):
+                    print("[ERROR] 「完了」ボタンが表示されていません。投稿フォームが開いていません。")
+                    post_page.screenshot(path="/tmp/debug_no_form.png")
+                    browser.close()
+                    return "url_not_found"
+                print("[INFO] 投稿フォームが正常に表示されています。")
+            except Exception as e:
+                print(f"[ERROR] 投稿フォームの確認に失敗: {e}")
+                browser.close()
+                return "url_not_found"
 
-            # 投稿前のURLを記録
-            url_before_submit = post_page.url
             dialog_messages.clear()  # ダイアログ履歴をリセット
 
             # Step 4: キャプション入力
@@ -293,7 +302,6 @@ def post_to_rakuten_room(product_info: dict, caption: str):
                     element = post_page.locator(selector).first
                     if element.is_visible(timeout=5000):
                         element.click()
-                        time.sleep(5)  # ダイアログが出るのを十分待つ
                         submitted = True
                         print(f"[INFO] 「完了」ボタンクリック成功: {selector}")
                         break
@@ -306,33 +314,69 @@ def post_to_rakuten_room(product_info: dict, caption: str):
                 browser.close()
                 return False
 
-            # 「完了」クリック後のダイアログチェック
-            if any("要求されたURL" in m or "存在しません" in m for m in dialog_messages):
-                print("[WARN] 「完了」クリック後に「要求されたURL存在しません」ダイアログ検知")
-                print("[WARN] この商品はROOMに投稿できません。別の商品で再試行します。")
-                post_page.screenshot(path="/tmp/debug_url_not_found_after_submit.png")
-                browser.close()
-                return "url_not_found"
-
+            # Step 6: 投稿完了を確認（「コレ！完了!」または「my ROOMを見る」の表示を待つ）
+            print("[INFO] 投稿完了を確認中...")
+            success = False
+            
+            # 最大15秒待つ
+            for i in range(15):
+                time.sleep(1)
+                try:
+                    page_content = post_page.content()
+                    current_url = post_page.url
+                    
+                    # 成功パターン1: 「コレ！完了!」テキストが表示される
+                    if "コレ！完了" in page_content or "コレ!完了" in page_content or "コレ完了" in page_content:
+                        print(f"[INFO] 「コレ！完了!」を検知 - 投稿成功！")
+                        success = True
+                        break
+                    
+                    # 成功パターン2: 「my ROOMを見る」ボタンが表示される
+                    try:
+                        my_room_btn = post_page.locator('a:has-text("my ROOM を見る"), a:has-text("my ROOMを見る")').first
+                        if my_room_btn.is_visible(timeout=1000):
+                            print(f"[INFO] 「my ROOMを見る」ボタンを検知 - 投稿成功！")
+                            success = True
+                            break
+                    except Exception:
+                        pass
+                    
+                    # 成功パターン3: URLが変わった場合（念のため）
+                    if current_url != collect_url and "collect" not in current_url:
+                        print(f"[INFO] URLが変化 - 投稿成功！: {current_url}")
+                        success = True
+                        break
+                    
+                    # ダイアログで失敗が検知された場合
+                    if any("要求されたURL" in m or "存在しません" in m for m in dialog_messages):
+                        print("[WARN] 「完了」クリック後に「要求されたURL存在しません」ダイアログ検知")
+                        break
+                    
+                    print(f"[INFO] 待機中... ({i+1}/15秒)")
+                except Exception as e:
+                    print(f"[DEBUG] 確認中にエラー: {e}")
+            
             post_page.screenshot(path="/tmp/debug_after_submit.png")
-            url_after_submit = post_page.url
-            print(f"[INFO] 投稿後URL: {url_after_submit}")
-
-            # 投稿後のURLが変わったか確認（変わっていなければ投稿失敗）
-            if url_after_submit == url_before_submit:
-                print("[WARN] 投稿後のURLが変わっていません。投稿が完了していません。")
+            
+            if success:
+                print("[INFO] 投稿が完了しました！")
+                browser.close()
+                return True
+            else:
+                # ダイアログで失敗が検知された場合
+                if any("要求されたURL" in m or "存在しません" in m for m in dialog_messages):
+                    print("[WARN] この商品はROOMに投稿できません。別の商品で再試行します。")
+                    browser.close()
+                    return "url_not_found"
+                
+                print("[WARN] 投稿完了を確認できませんでした。")
                 try:
                     title = post_page.title()
                     print(f"[INFO] ページタイトル: {title}")
-                    post_page.screenshot(path="/tmp/debug_url_unchanged.png")
                 except Exception:
                     pass
                 browser.close()
                 return "url_not_found"
-
-            print("[INFO] 投稿が完了しました！")
-            browser.close()
-            return True
 
         except PlaywrightTimeoutError as e:
             print(f"[ERROR] タイムアウトエラー: {e}")
