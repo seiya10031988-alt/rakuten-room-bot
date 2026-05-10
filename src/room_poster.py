@@ -1,16 +1,11 @@
 """
 room_poster.py
 クッキーを使って楽天Roomに自動ログイン・投稿するモジュール。
-【正しい投稿フロー】
-1. 楽天市場の商品ページにアクセス
-2. 「ROOMに投稿」ボタンをクリック（新しいタブで投稿ページが開く）
-3. テキストエリアにキャプションを入力
-4. 「完了」ボタンをクリック
 
 【修正履歴】
-- v6: 403エラーと「要求されたURL存在しません」の検知処理を追加
-- v7: 投稿後URLが変わらない場合を失敗と判定（"url_not_found"を返す）
-      「要求されたURL存在しません」の場合は投稿不可として"url_not_found"を返す
+- v8: Playwrightのdialogイベントで「要求されたURL存在しません」を確実に検知
+      「完了」ボタンクリック後にダイアログが出た場合はurl_not_foundを返す
+      vanilla-vagueなど投稿不可ショップのブラックリストを追加
 """
 import os
 import json
@@ -19,6 +14,12 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 RAKUTEN_COOKIES_JSON = os.environ.get("RAKUTEN_COOKIES", "")
 RAKUTEN_ROOM_URL = "https://room.rakuten.co.jp"
+
+# 楽天ROOMに投稿できないショップコードのブラックリスト
+BLACKLISTED_SHOPS = [
+    "vanilla-vague",  # 「要求されたURL存在しません」エラーが発生するショップ
+    "ferry",          # 不正なitemcode（ferry:10000000）を返すショップ
+]
 
 
 def load_cookies() -> list:
@@ -50,22 +51,12 @@ def load_cookies() -> list:
     return playwright_cookies
 
 
-def check_page_error(page) -> str:
-    """
-    ページにエラーが表示されているか確認する。
-    エラーの種類を返す。エラーなしの場合は空文字を返す。
-    """
-    try:
-        content = page.content()
-        if "403 Forbidden" in content or "認証が失敗しました" in content:
-            return "403_forbidden"
-        if "要求されたURL存在しません" in content:
-            return "url_not_found"
-        if "ページが見つかりません" in content or "404" in content:
-            return "404_not_found"
-    except Exception:
-        pass
-    return ""
+def is_blacklisted_shop(item_code_full: str) -> bool:
+    """ショップコードがブラックリストに含まれているか確認する。"""
+    if not item_code_full or ":" not in item_code_full:
+        return False
+    shop_code = item_code_full.split(":")[0]
+    return shop_code in BLACKLISTED_SHOPS
 
 
 def post_to_rakuten_room(product_info: dict, caption: str):
@@ -76,6 +67,13 @@ def post_to_rakuten_room(product_info: dict, caption: str):
       "url_not_found": 商品がROOMに投稿できない（別商品で再試行すべき）
       False: その他の失敗
     """
+    item_code_full = product_info.get("item_code_full", "")
+
+    # ブラックリストチェック
+    if is_blacklisted_shop(item_code_full):
+        print(f"[WARN] ブラックリストのショップのためスキップ: {item_code_full}")
+        return "url_not_found"
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -100,6 +98,16 @@ def post_to_rakuten_room(product_info: dict, caption: str):
             return False
 
         page = context.new_page()
+
+        # ダイアログ（アラート）を自動的に閉じ、内容を記録する
+        dialog_messages = []
+
+        def handle_dialog(dialog):
+            msg = dialog.message
+            dialog_messages.append(msg)
+            print(f"[INFO] ダイアログ検知: {msg}")
+            dialog.accept()
+
         try:
             # Step 1: 楽天Roomにアクセスしてログイン確認
             print("[INFO] 楽天Roomにアクセス中...")
@@ -142,15 +150,21 @@ def post_to_rakuten_room(product_info: dict, caption: str):
                         post_page.wait_for_load_state("domcontentloaded", timeout=60000)
                         time.sleep(3)
 
-                        # 新しいページのエラーチェック
-                        page_error = check_page_error(post_page)
-                        if page_error == "403_forbidden":
+                        # ダイアログハンドラを設定
+                        post_page.on("dialog", handle_dialog)
+                        time.sleep(1)  # ダイアログが出るのを待つ
+
+                        # 403チェック
+                        content = post_page.content()
+                        if "403 Forbidden" in content or "認証が失敗しました" in content:
                             print("[ERROR] 403 Forbidden - クッキーを更新してください。")
                             post_page.screenshot(path="/tmp/debug_403.png")
                             browser.close()
                             return False
-                        elif page_error == "url_not_found":
-                            print("[WARN] 「要求されたURL存在しません」- この商品はROOMに投稿できません。")
+
+                        # ダイアログで「要求されたURL存在しません」が出た場合
+                        if any("要求されたURL" in m or "存在しません" in m for m in dialog_messages):
+                            print("[WARN] 「要求されたURL存在しません」ダイアログ検知 - この商品はROOMに投稿できません。")
                             post_page.screenshot(path="/tmp/debug_url_not_found.png")
                             browser.close()
                             return "url_not_found"
@@ -166,38 +180,44 @@ def post_to_rakuten_room(product_info: dict, caption: str):
                 # 直接URLを構築してアクセス
                 print("[WARN] 「ROOMに投稿」ボタンが見つかりませんでした。直接URLを構築します...")
                 page.screenshot(path="/tmp/debug_no_room_button.png")
-                item_code_full = product_info.get("item_code_full", "")
-                shop_code = product_info.get("shop_code", "")
-                item_code = product_info.get("item_code", "")
                 if item_code_full:
                     collect_url = f"https://room.rakuten.co.jp/mix/collect?itemcode={item_code_full}&scid=we_room_upc60"
-                elif shop_code and item_code:
-                    collect_url = f"https://room.rakuten.co.jp/mix/collect?itemcode={shop_code}:{item_code}&scid=we_room_upc60"
                 else:
-                    print("[ERROR] itemcodeが取得できませんでした。")
-                    browser.close()
-                    return False
+                    shop_code = product_info.get("shop_code", "")
+                    item_code = product_info.get("item_code", "")
+                    if shop_code and item_code:
+                        collect_url = f"https://room.rakuten.co.jp/mix/collect?itemcode={shop_code}:{item_code}&scid=we_room_upc60"
+                    else:
+                        print("[ERROR] itemcodeが取得できませんでした。")
+                        browser.close()
+                        return False
+
                 print(f"[INFO] 投稿URLに直接アクセス: {collect_url}")
                 post_page = context.new_page()
+                # ダイアログハンドラを先に設定
+                post_page.on("dialog", handle_dialog)
                 post_page.goto(collect_url, wait_until="domcontentloaded", timeout=60000)
-                time.sleep(3)
+                time.sleep(5)  # ダイアログが出るのを十分待つ
                 print(f"[INFO] 投稿ページURL: {post_page.url}")
 
-                # 直接アクセス時のエラーチェック
-                page_error = check_page_error(post_page)
-                if page_error == "403_forbidden":
-                    print("[ERROR] 403 Forbidden - クッキーを更新してください。")
-                    post_page.screenshot(path="/tmp/debug_403.png")
-                    browser.close()
-                    return False
-                elif page_error == "url_not_found":
-                    print("[WARN] 「要求されたURL存在しません」- この商品はROOMに投稿できません。")
+                # ダイアログで「要求されたURL存在しません」が出た場合
+                if any("要求されたURL" in m or "存在しません" in m for m in dialog_messages):
+                    print("[WARN] 「要求されたURL存在しません」ダイアログ検知 - この商品はROOMに投稿できません。")
                     post_page.screenshot(path="/tmp/debug_url_not_found.png")
                     browser.close()
                     return "url_not_found"
 
+                # 403チェック
+                content = post_page.content()
+                if "403 Forbidden" in content or "認証が失敗しました" in content:
+                    print("[ERROR] 403 Forbidden - クッキーを更新してください。")
+                    post_page.screenshot(path="/tmp/debug_403.png")
+                    browser.close()
+                    return False
+
             # 投稿前のURLを記録
             url_before_submit = post_page.url
+            dialog_messages.clear()  # ダイアログ履歴をリセット
 
             # Step 4: キャプション入力
             print("[INFO] キャプション入力中...")
@@ -247,8 +267,7 @@ def post_to_rakuten_room(product_info: dict, caption: str):
                     element = post_page.locator(selector).first
                     if element.is_visible(timeout=5000):
                         element.click()
-                        post_page.wait_for_load_state("domcontentloaded", timeout=60000)
-                        time.sleep(3)
+                        time.sleep(5)  # ダイアログが出るのを十分待つ
                         submitted = True
                         print(f"[INFO] 「完了」ボタンクリック成功: {selector}")
                         break
@@ -261,33 +280,32 @@ def post_to_rakuten_room(product_info: dict, caption: str):
                 browser.close()
                 return False
 
+            # 「完了」クリック後のダイアログチェック
+            if any("要求されたURL" in m or "存在しません" in m for m in dialog_messages):
+                print("[WARN] 「完了」クリック後に「要求されたURL存在しません」ダイアログ検知")
+                print("[WARN] この商品はROOMに投稿できません。別の商品で再試行します。")
+                post_page.screenshot(path="/tmp/debug_url_not_found_after_submit.png")
+                browser.close()
+                return "url_not_found"
+
             post_page.screenshot(path="/tmp/debug_after_submit.png")
             url_after_submit = post_page.url
             print(f"[INFO] 投稿後URL: {url_after_submit}")
 
-            # 投稿後のURLが変わったか確認（変わっていなければ投稿失敗）
+            # 投稿後のURLが変わったか確認
             if url_after_submit == url_before_submit:
-                print("[WARN] 投稿後のURLが変わっていません。投稿が実際には完了していない可能性があります。")
+                print("[WARN] 投稿後のURLが変わっていません。")
                 # ページ内容を確認
-                page_error = check_page_error(post_page)
-                if page_error == "url_not_found":
-                    print("[WARN] 「要求されたURL存在しません」- この商品はROOMに投稿できません。")
-                    browser.close()
-                    return "url_not_found"
-                # URLが変わっていないが「要求されたURL存在しません」でもない場合
-                # → 投稿は完了しているかもしれない（ROOMの仕様でリダイレクトしない場合がある）
-                # → ページタイトルや内容で確認
                 try:
-                    title = post_page.title()
-                    print(f"[INFO] ページタイトル: {title}")
                     content = post_page.content()
                     if "コレ！して投稿する" in content:
                         print("[WARN] まだ投稿フォームが表示されています。投稿が完了していません。")
                         browser.close()
                         return "url_not_found"
+                    title = post_page.title()
+                    print(f"[INFO] ページタイトル: {title}")
                 except Exception:
                     pass
-                print("[INFO] URLは変わっていませんが、投稿が完了した可能性があります。")
 
             print("[INFO] 投稿が完了しました！")
             browser.close()
